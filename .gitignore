@@ -1,0 +1,13 @@
+*.log
+*.tmp
+*.tmp-*
+*.bak
+*.exe
+*.obj
+*.pdb
+*.ilk
+dist/
+material-bar.ini
+data/
+worker-error.txt
+
