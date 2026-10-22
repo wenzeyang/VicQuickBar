@@ -2,7 +2,7 @@
 #SingleInstance Force
 
 ;@Ahk2Exe-SetMainIcon assets\app.ico
-;@Ahk2Exe-SetVersion 1.0.0.0
+;@Ahk2Exe-SetVersion 1.0.1.0
 ;@Ahk2Exe-SetName Vic Quick Bar
 
 #Include modules\MaterialBarDrag.ahk
@@ -71,6 +71,45 @@ MaterialBarSmokeTest() {
             throw Error("状态提示没有以单行放在刷新按钮左侧")
         if MaterialBar.SourceButtons[MaterialBar.CurrentSourceIndex].Value != 1
             throw Error("当前素材标签没有保持选中高亮")
+        ; Regression: opening or switching a tab must keep the bar anchored on
+        ; every monitor. This catches delayed WM_SIZE reverse-sync drift on
+        ; secondary displays with a different DPI or desktop origin.
+        testOriginRect := MaterialBar.GetWindowRectangle(
+            MaterialBar.Window.Hwnd)
+        MaterialBar.SetExpanded(false)
+        Loop MonitorGetCount() {
+            MonitorGetWorkArea(A_Index, &workLeft, &workTop,
+                &workRight, &workBottom)
+            testWidth := testOriginRect.Width
+            testHeight := testOriginRect.Height
+            testX := workLeft + Max(0,
+                Floor((workRight - workLeft - testWidth) / 2))
+            testY := workBottom - testHeight - 24
+            MaterialBar.SetOuterWindowPosition(MaterialBar.Window.Hwnd,
+                testX, testY, testWidth, testHeight)
+            Sleep(50)
+            anchoredRect := MaterialBar.GetWindowRectangle(
+                MaterialBar.Window.Hwnd)
+            nextSource := Mod(MaterialBar.CurrentSourceIndex,
+                MaterialBar.Sources.Length) + 1
+            MaterialBar.ActivateSourceTab(nextSource)
+            Sleep(120)
+            switchedRect := MaterialBar.GetWindowRectangle(
+                MaterialBar.Window.Hwnd)
+            if Abs(switchedRect.Left - anchoredRect.Left) > 2
+                || Abs(switchedRect.Top - anchoredRect.Top) > 2
+                throw Error("扩展屏切换标签后素材栏发生坐标漂移")
+            pairedRect := MaterialBar.GetWindowRectangle(
+                MaterialBar.ContentWindow.Hwnd)
+            if Abs(pairedRect.Bottom + MaterialBar.PanelGap
+                    - switchedRect.Top) > 3
+                throw Error("扩展屏上的展示窗口没有与素材栏对齐")
+            MaterialBar.SetExpanded(false)
+        }
+        MaterialBar.SetOuterWindowPosition(MaterialBar.Window.Hwnd,
+            testOriginRect.Left, testOriginRect.Top,
+            testOriginRect.Width, testOriginRect.Height)
+        MaterialBar.SetExpanded(true)
         try {
             for size in [[512, 512], [768, 768],
                     [512, 768], [768, 512]] {
@@ -820,10 +859,13 @@ class MaterialBarApp {
             return
         desiredHeight := Max(320,
             this.WindowHeight - this.BarHeight - this.PanelGap)
-        availableHeight := barRect.Top - this.PanelGap
+        workArea := this.GetMonitorWorkAreaForWindow(this.Window.Hwnd)
+        workTop := IsObject(workArea) ? workArea.Top : 0
+        availableHeight := barRect.Top - workTop - this.PanelGap
         contentHeight := availableHeight >= 320
             ? Min(desiredHeight, availableHeight) : 320
-        contentY := barRect.Top - this.PanelGap - contentHeight
+        contentY := Max(workTop,
+            barRect.Top - this.PanelGap - contentHeight)
         this.SyncingWindows := true
         this.BeginProgrammaticSize()
         try {
@@ -882,6 +924,24 @@ class MaterialBarApp {
         top := NumGet(rect, 4, "int")
         right := NumGet(rect, 8, "int")
         bottom := NumGet(rect, 12, "int")
+        return {Left: left, Top: top, Right: right, Bottom: bottom,
+            Width: right - left, Height: bottom - top}
+    }
+
+    GetMonitorWorkAreaForWindow(hwnd) {
+        monitor := DllCall("user32\MonitorFromWindow", "ptr", hwnd,
+            "uint", 2, "ptr") ; MONITOR_DEFAULTTONEAREST
+        if !monitor
+            return 0
+        info := Buffer(40, 0)
+        NumPut("uint", 40, info, 0)
+        if !DllCall("user32\GetMonitorInfoW", "ptr", monitor,
+            "ptr", info.Ptr, "int")
+            return 0
+        left := NumGet(info, 20, "int")
+        top := NumGet(info, 24, "int")
+        right := NumGet(info, 28, "int")
+        bottom := NumGet(info, 32, "int")
         return {Left: left, Top: top, Right: right, Bottom: bottom,
             Width: right - left, Height: bottom - top}
     }
@@ -2130,7 +2190,9 @@ class MaterialBarApp {
             this.Status.Text := "历史文本仅使用内存，无需设置目录"
             return
         }
-        selected := DirSelect(source.Path, 0,
+        ; Prefixing the initial path with * selects it without making it the
+        ; dialog root, so the user can navigate to parent and sibling folders.
+        selected := DirSelect("*" source.Path, 0,
             "选择“" source.Name "”的素材目录")
         if selected = ""
             return
@@ -2607,10 +2669,10 @@ class MaterialBarApp {
     OnMouseDown(wParam, lParam, msg, hwnd) {
         dragTitle := hwnd = this.Title.Hwnd
         if !dragTitle && hwnd = this.Window.Hwnd {
-            x := this.SignedWord(lParam & 0xFFFF)
-            y := this.SignedWord((lParam >> 16) & 0xFFFF)
-            dragTitle := x >= 0 && x < this.TitleWidth
-                && y >= 0 && y < this.BarHeight
+            ; The uncovered top/bottom strips belong to the bar itself.
+            ; Treat all of that background as a drag surface instead of only
+            ; the narrow portion beneath the title.
+            dragTitle := true
         }
         if dragTitle {
             DllCall("user32\ReleaseCapture")
@@ -2815,7 +2877,11 @@ class MaterialBarApp {
                 this.WindowHeight := contentRect.Height
                     + this.PanelGap + barRect.Height
         }
-        if this.Expanded && !this.SyncingWindows
+        ; Only a real user resize of the content window may move the bar.
+        ; Programmatic Show/Move notifications can arrive after the guard in
+        ; ShowContentWindow has cleared; reverse-syncing those notifications
+        ; causes DPI-dependent drift on secondary monitors.
+        if this.Expanded && !this.SyncingWindows && this.UserSizingContent
             SetTimer(ObjBindMethod(this, "SyncBarToContent"), -20)
     }
 

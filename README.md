@@ -4,7 +4,7 @@
 
 ## 下载
 
-请从本仓库的 Releases 下载 `VicQuickBar-v1.0.0-win-x64-portable.zip`。解压后直接运行 `VicQuickBar.exe`，无需安装 AutoHotkey，也不依赖 PopDrop 主程序。
+请从本仓库的 Releases 下载 `VicQuickBar-v1.0.1-win-x64-portable.zip`。解压后直接运行 `VicQuickBar.exe`，无需安装 AutoHotkey，也不依赖 PopDrop 主程序。
 
 ## 主要功能
 
