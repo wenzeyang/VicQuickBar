@@ -11,7 +11,7 @@
 #Requires -Version 5.1
 
 param(
-    [string]$Version = "1.0.1"
+    [string]$Version = "1.0.2"
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,8 +38,8 @@ if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
 }
 
 $sourceText = Get-Content -LiteralPath $sourcePath -Raw
-if ($sourceText -notmatch ';@Ahk2Exe-SetVersion\s+1\.0\.1\.0') {
-    throw "MaterialBar.ahk does not declare version 1.0.1.0."
+if ($sourceText -notmatch ';@Ahk2Exe-SetVersion\s+1\.0\.2\.0') {
+    throw "MaterialBar.ahk does not declare version 1.0.2.0."
 }
 
 $distRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "dist"))

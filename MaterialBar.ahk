@@ -2,7 +2,7 @@
 #SingleInstance Force
 
 ;@Ahk2Exe-SetMainIcon assets\app.ico
-;@Ahk2Exe-SetVersion 1.0.1.0
+;@Ahk2Exe-SetVersion 1.0.2.0
 ;@Ahk2Exe-SetName Vic Quick Bar
 
 #Include modules\MaterialBarDrag.ahk
@@ -13,13 +13,35 @@ MBDrag_Init()
 global MaterialBar := MaterialBarApp()
 OnExit(MaterialBarExit)
 MaterialBar.Show()
-if A_Args.Length && A_Args[1] = "--smoke-test"
-    SetTimer(MaterialBarSmokeTest, -100)
+if A_Args.Length {
+    if A_Args[1] = "--smoke-test"
+        SetTimer(MaterialBarSmokeTest, -100)
+    else if A_Args[1] = "--first-click-perf-test"
+        SetTimer(MaterialBarFirstClickPerfTest, -100)
+}
 
 MaterialBarExit(*) {
     global MaterialBar
     try MaterialBar.Shutdown()
     DllCall("ole32\OleUninitialize")
+}
+
+MaterialBarFirstClickPerfTest() {
+    global MaterialBar
+    sourceIndex := A_Args.Length >= 2 && IsNumber(A_Args[2])
+        ? Max(1, Min(MaterialBar.Sources.Length, Integer(A_Args[2]))) : 1
+    MaterialBar.SetExpanded(false)
+    MaterialBar.PerfProbeActive := true
+    MaterialBar.PerfRefreshCount := 0
+    MaterialBar.PerfRefreshMs := 0
+    started := A_TickCount
+    MaterialBar.ActivateSourceTab(sourceIndex)
+    elapsed := A_TickCount - started
+    MaterialBar.PerfProbeActive := false
+    FileAppend("FIRST_CLICK_MS=" elapsed "`n"
+        . "REFRESH_CALLS=" MaterialBar.PerfRefreshCount "`n"
+        . "REFRESH_MS=" MaterialBar.PerfRefreshMs "`n", "*")
+    ExitApp(MaterialBar.PerfRefreshCount = 1 ? 0 : 3)
 }
 
 MaterialBarSmokeTest() {
@@ -144,6 +166,31 @@ MaterialBarSmokeTest() {
         MaterialBar.SetViewMode("ExtraLarge")
         if MaterialBar.ImageWidth != largeIconSize * 2
             throw Error("超大图标不是大图标的两倍")
+        MaterialBar.SetViewMode("Small")
+        if MaterialBar.ImageListType != 0
+            throw Error("小图标模式仍在使用会裁切缩略图的小图像列表")
+        if !MaterialBar.IsMedia("probe.mp4")
+            || !MaterialBar.IsMedia("probe.jpg")
+            || MaterialBar.IsMedia("probe.pdf")
+            throw Error("媒体缩略图类型筛选异常")
+        landscapeFit := MaterialBar.FitMediaRectangle(
+            1920, 1080, 250, 250)
+        portraitFit := MaterialBar.FitMediaRectangle(
+            1080, 1920, 250, 250)
+        if landscapeFit.Width <= landscapeFit.Height
+            || portraitFit.Height <= portraitFit.Width
+            || Abs(landscapeFit.Width / landscapeFit.Height - 16 / 9) > 0.02
+            || Abs(portraitFit.Width / portraitFit.Height - 9 / 16) > 0.02
+            throw Error("媒体缩略图没有保持原始宽高比")
+        MaterialBar.SetViewMode("ExtraLarge")
+        for argumentIndex, mediaPath in A_Args {
+            if argumentIndex = 1 || !MaterialBar.IsMedia(mediaPath)
+                continue
+            if !FileExist(mediaPath)
+                throw Error("缩略图测试素材不存在：" mediaPath)
+            if !MaterialBar.AddMediaThumbnailToList(mediaPath)
+                throw Error("无法生成媒体缩略图：" mediaPath)
+        }
         if !MaterialBar.AddExtensionBadgeToList("pptx")
             throw Error("扩展名徽标图标生成失败")
         if MaterialBar.LastExtensionBadgeOpaquePixels < 1
@@ -273,9 +320,16 @@ class MaterialBarApp {
         this.DragStartY := 0
         this.IgnoreSizePersistence := false
         this.IgnorePreviewSizePersistence := false
+        this.PerfProbeActive := false
+        this.PerfRefreshCount := 0
+        this.PerfRefreshMs := 0
         this.HasShownWindow := false
         this.SmokeTestMode := A_Args.Length
-            && A_Args[1] = "--smoke-test"
+            && (A_Args[1] = "--smoke-test"
+                || A_Args[1] = "--first-click-perf-test")
+        ; Native window animation keeps the effect light: no frame timer,
+        ; off-screen bitmap, or continuously running worker is required.
+        this.ContentAnimationDuration := this.SmokeTestMode ? 1 : 120
         this.UserSizingBar := false
         this.UserSizingContent := false
         this.PanelGap := 8
@@ -823,7 +877,11 @@ class MaterialBarApp {
         IniWrite(index, this.ConfigPath, "General", "LastSource")
         this.UpdateSourceButtons()
         this.UpdateTextCaptureButton()
-        this.Refresh()
+        ; When the bar is collapsed there is no visible list to update.
+        ; SetExpanded(true) performs the one required refresh after the content
+        ; window is positioned, avoiding two full directory scans per first click.
+        if this.Expanded
+            this.Refresh()
     }
 
     ActivateSourceTab(index, *) {
@@ -841,22 +899,32 @@ class MaterialBarApp {
         this.Expanded := expanded
         this.UpdateSourceButtons()
         if expanded {
-            this.ShowContentWindow()
-            SetTimer(this.WindowPairTimer, 30)
+            ; Build the hidden content first so the upward animation reveals a
+            ; complete list instead of an empty window that fills afterwards.
+            this.PrepareContentWindow()
             this.Refresh()
+            this.ShowPreparedContentWindow(true)
+            SetTimer(this.WindowPairTimer, 30)
         } else {
             SetTimer(this.WindowPairTimer, 0)
             this.HoverRow := 0
             this.ShowEmptyPreview()
             this.PreviewWindow.Hide()
-            this.ContentWindow.Hide()
+            if !this.AnimateContentWindow(false)
+                this.ContentWindow.Hide()
         }
     }
 
-    ShowContentWindow() {
+    ShowContentWindow(animate := false) {
+        if !this.PrepareContentWindow()
+            return false
+        return this.ShowPreparedContentWindow(animate)
+    }
+
+    PrepareContentWindow() {
         barRect := this.GetWindowRectangle(this.Window.Hwnd)
         if !IsObject(barRect)
-            return
+            return false
         desiredHeight := Max(320,
             this.WindowHeight - this.BarHeight - this.PanelGap)
         workArea := this.GetMonitorWorkAreaForWindow(this.Window.Hwnd)
@@ -869,9 +937,6 @@ class MaterialBarApp {
         this.SyncingWindows := true
         this.BeginProgrammaticSize()
         try {
-            this.ContentWindow.Show("NA x" barRect.Left
-                . " y" contentY " w" barRect.Width
-                . " h" contentHeight)
             this.SetOuterWindowPosition(this.ContentWindow.Hwnd,
                 barRect.Left, contentY, barRect.Width, contentHeight)
         } finally {
@@ -879,6 +944,31 @@ class MaterialBarApp {
         }
         this.LayoutContentWindow()
         this.UpdateTextCaptureButton()
+        return true
+    }
+
+    ShowPreparedContentWindow(animate := false) {
+        if DllCall("user32\IsWindowVisible",
+            "ptr", this.ContentWindow.Hwnd, "int")
+            return true
+        if animate && this.AnimateContentWindow(true)
+            return true
+        this.ContentWindow.Show("NA")
+        return true
+    }
+
+    AnimateContentWindow(show) {
+        visible := DllCall("user32\IsWindowVisible",
+            "ptr", this.ContentWindow.Hwnd, "int")
+        if (show && visible) || (!show && !visible)
+            return true
+        ; AW_SLIDE plus the vertical direction lets Windows animate the HWND
+        ; directly. Show rises bottom-to-top; hide returns top-to-bottom.
+        flags := 0x40000 | (show ? 0x8 : 0x10000 | 0x4)
+        return DllCall("user32\AnimateWindow",
+            "ptr", this.ContentWindow.Hwnd,
+            "uint", this.ContentAnimationDuration,
+            "uint", flags, "int") != 0
     }
 
     SyncContentToBar(*) {
@@ -979,6 +1069,9 @@ class MaterialBarApp {
     }
 
     Refresh(*) {
+        perfStart := this.PerfProbeActive ? A_TickCount : 0
+        if this.PerfProbeActive
+            this.PerfRefreshCount += 1
         source := this.Sources[this.CurrentSourceIndex]
         this.HoverRow := 0
         if this.Expanded
@@ -1026,6 +1119,8 @@ class MaterialBarApp {
                 "`r`n`r`n请从“设置 → 更换当前标签目录”重新选择。")
         } finally {
             this.List.Opt("+Redraw")
+            if perfStart
+                this.PerfRefreshMs += A_TickCount - perfStart
         }
     }
 
@@ -1367,8 +1462,8 @@ class MaterialBarApp {
             this.ImageList := 0
         }
 
-        ; Thumbnails are 30% larger than the first layout while keeping the
-        ; source aspect ratio through the native image-list loader.
+        ; Every icon view uses a square cell. Media is composed into that cell
+        ; separately so Windows never stretches the source to a square.
         size := Map("ExtraLarge", 250, "Large", 125,
             "Medium", 83, "Small", 42, "List", 29)[this.ViewMode]
         this.ImageWidth := size
@@ -1384,8 +1479,11 @@ class MaterialBarApp {
         this.ImageList := DllCall("comctl32\ImageList_Create",
             "int", this.ImageWidth, "int", this.ImageHeight, "uint", 0x21,
             "int", 32, "int", 24, "ptr")
+        ; Small icon view clips custom 42 px thumbnails on some systems.
+        ; Keep every grid mode on the normal image-list slot; only the report
+        ; view uses the small slot.
         this.ImageListType := !this.TextCardMode
-            && (this.ViewMode = "Small" || this.ViewMode = "List") ? 1 : 0
+            && this.ViewMode = "List" ? 1 : 0
         this.List.SetImageList(this.ImageList, this.ImageListType)
         this.ApplyListViewMode()
     }
@@ -1407,9 +1505,14 @@ class MaterialBarApp {
             DllCall("user32\SendMessageW", "ptr", this.List.Hwnd,
                 "uint", 0x1035, "ptr", 0, "ptr", spacing)
         } else if this.ViewMode = "Small" {
-            this.List.Opt("+IconSmall")
+            this.List.Opt("+Icon")
             this.List.SetFont("s" Max(7, this.UIFontSize - 2),
                 this.UIFontName)
+            spacingWidth := this.ImageWidth + 74
+            spacingHeight := this.ImageHeight + 28
+            spacing := (spacingHeight << 16) | (spacingWidth & 0xFFFF)
+            DllCall("user32\SendMessageW", "ptr", this.List.Hwnd,
+                "uint", 0x1035, "ptr", 0, "ptr", spacing)
         } else {
             this.List.Opt("+Report")
             this.List.SetFont("s" Max(8, this.UIFontSize - 1),
@@ -1449,11 +1552,14 @@ class MaterialBarApp {
             return 0
         if item.IsDir
             imagePath := this.AssetDir "\empty-folder.ico"
-        else if item.Kind = "file" && this.IsImage(item.Path) {
-            icon := this.AddAspectImageToList(item.Path)
+        else if item.Kind = "file" && this.IsMedia(item.Path) {
+            icon := this.AddMediaThumbnailToList(item.Path)
             if icon
                 return icon
-            imagePath := item.Path
+            icon := this.AddExtensionBadgeToList(item.Extension)
+            if icon
+                return icon
+            imagePath := this.AssetDir "\app.ico"
         }
         else {
             icon := this.AddExtensionBadgeToList(item.Extension)
@@ -1671,14 +1777,131 @@ class MaterialBarApp {
         return StrLen(name) > limit ? SubStr(name, 1, limit - 1) "…" : name
     }
 
-    AddAspectImageToList(path) {
-        try {
-            ; AutoHotkey delegates this load to the Windows image-list
-            ; loader, which scales the source down without cropping it and
-            ; handles PNG/BMP alpha reliably.
-            return IL_Add(this.ImageList, path)
-        } catch
+    AddMediaThumbnailToList(path) {
+        bitmap := this.GetShellThumbnailBitmap(path,
+            this.ImageWidth, this.ImageHeight)
+        if !bitmap
             return 0
+        try return this.AddAspectBitmapToList(bitmap)
+        finally DllCall("gdi32\DeleteObject", "ptr", bitmap)
+    }
+
+    GetShellThumbnailBitmap(path, width, height) {
+        factory := 0
+        bitmap := 0
+        iid := Buffer(16, 0)
+        if DllCall("ole32\CLSIDFromString",
+            "wstr", "{BCC18B79-BA16-442F-80C4-8A59C30C463B}",
+            "ptr", iid.Ptr, "int")
+            return 0
+        try {
+            if DllCall("shell32\SHCreateItemFromParsingName",
+                "wstr", path, "ptr", 0, "ptr", iid.Ptr,
+                "ptr*", &factory, "int")
+                return 0
+            requested := (width & 0xFFFFFFFF)
+                | ((height & 0xFFFFFFFF) << 32)
+            ; THUMBNAILONLY prevents icon fallback; BIGGERSIZEOK lets Windows
+            ; return the best cached video frame without square cropping.
+            if ComCall(3, factory, "int64", requested,
+                "uint", 0x9, "ptr*", &bitmap, "int")
+                return 0
+            return bitmap
+        } finally {
+            if factory
+                ObjRelease(factory)
+        }
+    }
+
+    AddAspectBitmapToList(bitmap) {
+        size := this.GetBitmapSize(bitmap)
+        if !IsObject(size)
+            return 0
+        screenDC := DllCall("user32\GetDC", "ptr", 0, "ptr")
+        targetDC := screenDC ? DllCall("gdi32\CreateCompatibleDC",
+            "ptr", screenDC, "ptr") : 0
+        sourceDC := screenDC ? DllCall("gdi32\CreateCompatibleDC",
+            "ptr", screenDC, "ptr") : 0
+        targetBitmap := targetDC ? DllCall("gdi32\CreateCompatibleBitmap",
+            "ptr", screenDC, "int", this.ImageWidth,
+            "int", this.ImageHeight, "ptr") : 0
+        if !screenDC || !targetDC || !sourceDC || !targetBitmap {
+            if targetBitmap
+                DllCall("gdi32\DeleteObject", "ptr", targetBitmap)
+            if sourceDC
+                DllCall("gdi32\DeleteDC", "ptr", sourceDC)
+            if targetDC
+                DllCall("gdi32\DeleteDC", "ptr", targetDC)
+            if screenDC
+                DllCall("user32\ReleaseDC", "ptr", 0, "ptr", screenDC)
+            return 0
+        }
+        oldTarget := DllCall("gdi32\SelectObject", "ptr", targetDC,
+            "ptr", targetBitmap, "ptr")
+        oldSource := DllCall("gdi32\SelectObject", "ptr", sourceDC,
+            "ptr", bitmap, "ptr")
+        try {
+            canvas := Buffer(16, 0)
+            NumPut("int", this.ImageWidth, canvas, 8)
+            NumPut("int", this.ImageHeight, canvas, 12)
+            DllCall("user32\FillRect", "ptr", targetDC,
+                "ptr", canvas.Ptr,
+                "ptr", DllCall("gdi32\GetStockObject", "int", 0, "ptr"))
+            fit := this.FitMediaRectangle(size.Width, size.Height,
+                this.ImageWidth, this.ImageHeight)
+            DllCall("gdi32\SetStretchBltMode",
+                "ptr", targetDC, "int", 4, "int") ; HALFTONE
+            if !DllCall("gdi32\StretchBlt",
+                "ptr", targetDC, "int", fit.X, "int", fit.Y,
+                "int", fit.Width, "int", fit.Height,
+                "ptr", sourceDC, "int", 0, "int", 0,
+                "int", size.Width, "int", size.Height,
+                "uint", 0x00CC0020, "int")
+                return 0
+            DllCall("gdi32\SelectObject", "ptr", sourceDC,
+                "ptr", oldSource, "ptr")
+            oldSource := 0
+            DllCall("gdi32\SelectObject", "ptr", targetDC,
+                "ptr", oldTarget, "ptr")
+            oldTarget := 0
+            index := DllCall("comctl32\ImageList_Add",
+                "ptr", this.ImageList, "ptr", targetBitmap,
+                "ptr", 0, "int")
+            return index >= 0 ? index + 1 : 0
+        } finally {
+            if oldSource
+                DllCall("gdi32\SelectObject", "ptr", sourceDC,
+                    "ptr", oldSource, "ptr")
+            if oldTarget
+                DllCall("gdi32\SelectObject", "ptr", targetDC,
+                    "ptr", oldTarget, "ptr")
+            DllCall("gdi32\DeleteObject", "ptr", targetBitmap)
+            DllCall("gdi32\DeleteDC", "ptr", sourceDC)
+            DllCall("gdi32\DeleteDC", "ptr", targetDC)
+            DllCall("user32\ReleaseDC", "ptr", 0, "ptr", screenDC)
+        }
+    }
+
+    GetBitmapSize(bitmap) {
+        info := Buffer(A_PtrSize = 8 ? 32 : 24, 0)
+        if !DllCall("gdi32\GetObjectW", "ptr", bitmap,
+            "int", info.Size, "ptr", info.Ptr, "int")
+            return 0
+        width := Abs(NumGet(info, 4, "int"))
+        height := Abs(NumGet(info, 8, "int"))
+        return width && height ? {Width: width, Height: height} : 0
+    }
+
+    FitMediaRectangle(sourceWidth, sourceHeight, targetWidth, targetHeight) {
+        padding := Max(2, Round(Min(targetWidth, targetHeight) * 0.04))
+        innerWidth := Max(1, targetWidth - padding * 2)
+        innerHeight := Max(1, targetHeight - padding * 2)
+        scale := Min(innerWidth / sourceWidth, innerHeight / sourceHeight)
+        drawWidth := Max(1, Round(sourceWidth * scale))
+        drawHeight := Max(1, Round(sourceHeight * scale))
+        return {X: Floor((targetWidth - drawWidth) / 2),
+            Y: Floor((targetHeight - drawHeight) / 2),
+            Width: drawWidth, Height: drawHeight}
     }
 
     SetViewMode(mode, *) {
@@ -1745,18 +1968,18 @@ class MaterialBarApp {
             this.PreviewText.Visible := true
             this.PreviewText.Value := this.ReadItemText(item)
             this.PreviewMeta.Value := this.BuildFileInfo(item)
-        } else if item.Kind = "file" && this.IsImage(item.Path) {
+        } else if item.Kind = "file" && this.IsMedia(item.Path) {
             this.PreviewHasImage := true
             this.PreviewText.Visible := false
             try {
-                if !this.SetPreviewImage(item.Path)
-                    throw Error("无法载入图片")
+                if !this.SetPreviewMediaImage(item.Path)
+                    throw Error("无法载入媒体缩略图")
                 this.PreviewImage.Visible := true
             } catch {
                 this.PreviewHasImage := false
                 this.PreviewImage.Visible := false
                 this.PreviewText.Visible := true
-                this.PreviewText.Value := "无法生成图片预览。"
+                this.PreviewText.Value := "无法生成图片或视频预览。"
             }
             this.PreviewMeta.Value := this.BuildFileInfo(item)
         } else if item.Kind = "folder" {
@@ -1818,9 +2041,42 @@ class MaterialBarApp {
         }
     }
 
+    SetPreviewMediaImage(path) {
+        if this.IsImage(path)
+            return this.SetPreviewImage(path)
+        if !this.IsVideo(path)
+            return false
+        this.ClearPreviewBitmap()
+        bitmap := this.GetShellThumbnailBitmap(path,
+            this.PreviewImageAreaWidth, this.PreviewImageAreaHeight)
+        if !bitmap
+            return false
+        try {
+            size := this.GetBitmapSize(bitmap)
+            if !IsObject(size)
+                return false
+            fit := this.FitMediaRectangle(size.Width, size.Height,
+                this.PreviewImageAreaWidth, this.PreviewImageAreaHeight)
+            imageX := this.PreviewImageAreaX + fit.X
+            imageY := this.PreviewImageAreaY + fit.Y
+            this.PreviewImage.Value := "HBITMAP:*" bitmap
+            this.PreviewImage.Move(imageX, imageY, fit.Width, fit.Height)
+            this.PreviewBitmap := bitmap
+            this.PreviewImagePath := path
+            bitmap := 0
+            return true
+        } finally {
+            if bitmap
+                DllCall("gdi32\DeleteObject", "ptr", bitmap)
+        }
+    }
+
     ClearPreviewBitmap() {
-        try this.PreviewImage.Value := ""
+        bitmap := this.PreviewBitmap
         this.PreviewBitmap := 0
+        try this.PreviewImage.Value := ""
+        if bitmap
+            DllCall("gdi32\DeleteObject", "ptr", bitmap)
         this.PreviewImagePath := ""
     }
 
@@ -1902,6 +2158,16 @@ class MaterialBarApp {
         SplitPath(path, , , &extension)
         return RegExMatch(extension,
             "i)^(?:png|jpe?g|webp|gif|bmp|tif|tiff)$") != 0
+    }
+
+    IsVideo(path) {
+        SplitPath(path, , , &extension)
+        return RegExMatch(extension,
+            "i)^(?:mp4|m4v|mov|mkv|avi|wmv|webm|flv|mpe?g|ts|mts|m2ts|3gp)$") != 0
+    }
+
+    IsMedia(path) {
+        return this.IsImage(path) || this.IsVideo(path)
     }
 
     GetSelectedItems(clickedRow := 0) {
@@ -2977,7 +3243,7 @@ class MaterialBarApp {
             SetTimer(ObjBindMethod(this,
                 "EndPreviewProgrammaticSize"), -180)
             if this.PreviewHasImage && this.PreviewImagePath != ""
-                this.SetPreviewImage(this.PreviewImagePath)
+                this.SetPreviewMediaImage(this.PreviewImagePath)
         }
     }
 
@@ -2994,7 +3260,7 @@ class MaterialBarApp {
         this.LayoutPreview(width, height)
         if imagePath != "" {
             this.PreviewHasImage := true
-            try this.SetPreviewImage(imagePath)
+            try this.SetPreviewMediaImage(imagePath)
         }
         if this.IgnorePreviewSizePersistence
             return

@@ -4,7 +4,7 @@
 
 ## 下载
 
-请从本仓库的 Releases 下载 `VicQuickBar-v1.0.1-win-x64-portable.zip`。解压后直接运行 `VicQuickBar.exe`，无需安装 AutoHotkey，也不依赖 PopDrop 主程序。
+请从本仓库的 Releases 下载 `VicQuickBar-v1.0.2-win-x64-portable.zip`。解压后直接运行 `VicQuickBar.exe`，无需安装 AutoHotkey，也不依赖 PopDrop 主程序。
 
 ## 主要功能
 
@@ -14,6 +14,7 @@
 - 超大图标、大图标、中图标、小图标和列表五种显示模式。
 - 悬浮预览、预览窗口自由缩放，以及 `512 × 512`、`768 × 768`、`512 × 768`、`768 × 512` 快捷尺寸。
 - 展示区与底部快捷栏是两个独立圆角窗口，可置顶、移动并保持对齐。
+- 点击标签时展示窗口使用 Windows 原生滑动动画快速升起或收回，无常驻动画线程。
 - 默认使用 `F3` 显示或隐藏。
 
 ## 数据与隐私
